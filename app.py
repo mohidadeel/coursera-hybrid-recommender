@@ -17,43 +17,24 @@ nltk.download('vader_lexicon', quiet=True)
 # --- BACKEND ENGINE (CACHED) ---
 @st.cache_resource(show_spinner="Initializing Hybrid Engine (This takes ~15 seconds on startup)...")
 def load_and_train_system():
-    # 1. Load Data
-    courses_df = pd.read_csv('Coursera_courses.csv')
-    reviews_df = pd.read_csv('Coursera_reviews.csv')
-    data_df = pd.read_csv('coursera_data.csv')
+    # 1. Load the Pre-Joined Mini Dataset
+    # We skip the heavy joining process because it is already done!
+    master_df = pd.read_csv('coursera_mini_master.csv')
 
-    # Fix Unnamed Column
-    if data_df.columns[0] in ['Unnamed: 0', '']:
-        data_df.rename(columns={data_df.columns[0]: 'dataset_id'}, inplace=True)
-
-    # 2. Relational Joins
-    courses_df['join_title'] = courses_df['name'].astype(str).str.strip().str.lower()
-    data_df['join_title'] = data_df['course_title'].astype(str).str.strip().str.lower()
-
-    step_a_df = pd.merge(reviews_df, courses_df, on='course_id', how='inner')
-    master_df = pd.merge(step_a_df, data_df, on='join_title', how='inner')
-    if len(master_df) == 0: 
-        master_df = pd.merge(step_a_df, data_df, on='join_title', how='left')
-
-    master_df = master_df.drop_duplicates(subset=['reviewers', 'course_id'])
-    
-    # Use a 25,000 row sample to keep the web app fast and responsive
-    master_df = master_df.sample(n=min(25000, len(master_df)), random_state=42).copy()
-
-    # 3. Sentiment Adjustments
+    # 2. Sentiment Adjustments
     sia = SentimentIntensityAnalyzer()
     master_df['reviews'] = master_df['reviews'].fillna('').astype(str)
     master_df['sentiment_score'] = master_df['reviews'].apply(lambda x: sia.polarity_scores(x)['compound'])
     master_df['adjusted_rating'] = (master_df['rating'] + (0.15 * master_df['sentiment_score'])).clip(1.0, 5.0)
 
-    # 4. Train SVD (Collaborative Filtering)
+    # 3. Train SVD (Collaborative Filtering)
     reader = Reader(rating_scale=(1.0, 5.0))
     data_for_svd = Dataset.load_from_df(master_df[['reviewers', 'course_id', 'adjusted_rating']], reader)
     trainset = data_for_svd.build_full_trainset()
     svd_model = SVD(n_factors=50, lr_all=0.005, reg_all=0.02)
     svd_model.fit(trainset)
 
-    # 5. Build Content Matrix (TF-IDF)
+    # 4. Build Content Matrix (TF-IDF)
     unique_courses = master_df.drop_duplicates(subset=['course_id']).copy().reset_index(drop=True)
     tfidf = TfidfVectorizer(stop_words='english', max_features=5000)
     tfidf_matrix = tfidf.fit_transform(unique_courses['name'].fillna(''))
