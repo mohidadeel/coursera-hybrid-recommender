@@ -4,3 +4,5 @@ numpy
 nltk
 scikit-learn
 scikit-surprise
+matplotlib
+seaborn
