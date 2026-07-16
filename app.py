@@ -229,7 +229,7 @@ with tab2:
     st.subheader("System Diagnostics & Exploratory Data Analysis")
     st.markdown("Review the analytical framework verifying the performance parameters of the system.")
     
-    # NEW: Live Computed Algorithm Metrics
+    # Live Computed Algorithm Metrics
     st.markdown("### 🧮 Live Algorithm Performance Metrics")
     st.markdown("The following metrics are dynamically calculated in real-time using an 80/20 train/test split of the ingested Coursera dataset.")
     
@@ -244,12 +244,26 @@ with tab2:
         st.markdown("### 📈 Core System Foundations & The Sentiment Gap")
         col_g1, col_g2 = st.columns(2)
         with col_g1:
-            st.image(f"{image_folder}/Fig_4_01_Difficulty.png", caption="Figure 4.1: Corpus Difficulty Breakdown", use_container_width=True)
-            st.image(f"{image_folder}/Fig_4_08_SentimentGap.png", caption="Figure 4.2: Boxplot Verification of the Sentiment-Rating Gap", use_container_width=True)
+            st.image(f"{image_folder}/Fig_4_01_Difficulty.png", caption="Corpus Difficulty Breakdown", use_container_width=True)
+            st.image(f"{image_folder}/Fig_4_08_SentimentGap.png", caption="Boxplot Verification of the Sentiment-Rating Gap", use_container_width=True)
         with col_g2:
-            st.image(f"{image_folder}/Fig_4_02_Institutions.png", caption="Figure 4.3: Top Institutional Distribution", use_container_width=True)
-            st.image(f"{image_folder}/Fig_4_10_RatingShift.png", caption="Figure 4.4: Density Analysis of Rating Calibration Curves", use_container_width=True)
+            st.image(f"{image_folder}/Fig_4_02_Institutions.png", caption="Top Institutional Distribution", use_container_width=True)
+            st.image(f"{image_folder}/Fig_4_10_RatingShift.png", caption="Density Analysis of Rating Calibration Curves", use_container_width=True)
             
+        st.write("---")
+        
+        # MISSING SECTION RESTORED HERE
+        st.markdown("### 🔬 Machine Learning Evaluation & Predictive Rigor")
+        col_g3, col_g4 = st.columns(2)
+        with col_g3:
+            st.image(f"{image_folder}/Fig_5_01_Accuracy.png", caption="Error Metric Comparison (RMSE/MAE)", use_container_width=True)
+            st.image(f"{image_folder}/Fig_5_04_NDCG.png", caption="Ranking Quality Evaluation (NDCG@K)", use_container_width=True)
+        with col_g4:
+            st.image(f"{image_folder}/Fig_5_02_ErrorDist.png", caption="SVD Model Prediction Error Spread", use_container_width=True)
+            st.image(f"{image_folder}/Fig_5_08_Latency.png", caption="Query System Latency Analysis", use_container_width=True)
+            
+        st.write("---")
+        
         with st.expander("📂 Click to Expand Complete Technical Report Visual Appendix (All 22 Graphs)"):
             all_images = sorted([f for f in os.listdir(image_folder) if f.endswith('.png')])
             for img in all_images:
