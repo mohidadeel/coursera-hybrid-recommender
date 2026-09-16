@@ -1,5 +1,6 @@
 import os
 import time
+import hashlib
 from pathlib import Path
 from collections import defaultdict
 
@@ -48,6 +49,7 @@ HYBRID_EVAL_MIN_COURSES = 5
 HYBRID_EVAL_TEST_FRACTION = 0.20
 HYBRID_EVAL_K = 5
 HYBRID_EVAL_BOOTSTRAPS = 1000
+HYBRID_SENSITIVITY_THRESHOLDS = [3, 4, 5]
 
 BENCHMARK_QUERIES = [
     "Data Science",
@@ -905,25 +907,45 @@ def _bootstrap_paired_difference_ci(
     )
 
 
-def run_hybrid_offline_evaluation(backend: dict) -> dict:
+def _stable_user_seed(user_id: str, base_seed: int = RANDOM_STATE) -> int:
+    """Return a reproducible per-user RNG seed independent of Python hash randomisation."""
+    digest = hashlib.sha256(
+        f"{base_seed}:{user_id}".encode("utf-8")
+    ).digest()
+    return int.from_bytes(digest[:8], "little") % (2**32 - 1)
+
+
+def run_hybrid_offline_evaluation(
+    backend: dict,
+    min_courses: int = HYBRID_EVAL_MIN_COURSES,
+    test_fraction: float = HYBRID_EVAL_TEST_FRACTION,
+    min_train_courses: int = 3,
+    leave_one_positive_out: bool = False,
+) -> dict:
     """
     Evaluate the complete recommendation design using a reproducible
-    leave-some-positive-out protocol over repeat learners.
+    positive-interaction holdout protocol over repeat learners.
 
-    Protocol:
-    - Aggregate to one interaction per learner/course.
-    - Keep learners with >= 5 unique courses and at least one positive item.
-    - Hold out ~20% of positive courses, at least one, while retaining >= 3
-      training courses.
-    - Build each learner's semantic profile from their remaining positively
-      rated courses.
-    - Rank all courses the learner did not train on.
-    - Compare global quality, SBERT-only, raw-rating SVD, sentiment-adjusted
-      SVD, and two 50/50 hybrid variants.
-    - Sweep hybrid personalisation weights using the sentiment-adjusted SVD.
+    Parameters
+    ----------
+    min_courses:
+        Minimum number of unique historical courses required for a learner.
+    test_fraction:
+        Target fraction of interactions to hold out when
+        ``leave_one_positive_out`` is False.
+    min_train_courses:
+        Minimum number of courses that must remain in the learner profile.
+    leave_one_positive_out:
+        When True, exactly one positively rated course is held out per learner.
+        This is used for the 3/4/5-history sensitivity analysis so thresholds
+        are comparable even when histories are short.
 
-    This is an internal offline evaluation based on historical interactions,
-    not an external human relevance judgement.
+    The main evaluation keeps the stricter >=5-course, ~20% positive holdout
+    protocol. A separate sensitivity analysis can call this function with
+    thresholds 3, 4, and 5 using leave-one-positive-out.
+
+    This remains an internal offline evaluation based on historical
+    interactions, not an external human relevance judgement.
     """
     master_df = backend["master_df"]
     unique_courses = backend["unique_courses"]
@@ -963,13 +985,13 @@ def run_hybrid_offline_evaluation(backend: dict) -> dict:
     )
 
     eligible_users = user_stats[
-        (user_stats["unique_courses"] >= HYBRID_EVAL_MIN_COURSES)
+        (user_stats["unique_courses"] >= min_courses)
         & (user_stats["positive_courses"] >= 1)
     ].index.tolist()
 
-    rng = np.random.default_rng(RANDOM_STATE)
     holdout_rows = []
     train_mask = np.ones(len(interactions), dtype=bool)
+    shared_rng = np.random.default_rng(RANDOM_STATE)
 
     for user_id in eligible_users:
         user_indices = interactions.index[
@@ -984,20 +1006,36 @@ def run_hybrid_offline_evaluation(backend: dict) -> dict:
         if len(positive_indices) == 0:
             continue
 
-        desired_test = max(
-            1,
-            int(np.ceil(
-                len(user_indices) * HYBRID_EVAL_TEST_FRACTION
-            )),
-        )
-        max_test = max(1, len(user_indices) - 3)
-        test_count = min(
-            desired_test,
-            len(positive_indices),
-            max_test,
-        )
+        if leave_one_positive_out:
+            # Use a stable per-user RNG so the same learner receives the same
+            # held-out course across the 3/4/5-history sensitivity thresholds.
+            user_rng = np.random.default_rng(
+                _stable_user_seed(str(user_id))
+            )
+            test_count = 1
+        else:
+            # Preserve the original strict-evaluation split exactly.
+            user_rng = shared_rng
+            desired_test = max(
+                1,
+                int(np.ceil(len(user_indices) * test_fraction)),
+            )
+            max_test = max(
+                1,
+                len(user_indices) - min_train_courses,
+            )
+            test_count = min(
+                desired_test,
+                len(positive_indices),
+                max_test,
+            )
 
-        selected = rng.choice(
+        # Do not evaluate a learner if holding out the requested item(s) would
+        # leave too little history for a meaningful profile.
+        if len(user_indices) - test_count < min_train_courses:
+            continue
+
+        selected = user_rng.choice(
             positive_indices,
             size=test_count,
             replace=False,
@@ -1025,7 +1063,7 @@ def run_hybrid_offline_evaluation(backend: dict) -> dict:
     eval_users = [
         user_id
         for user_id in holdout_df["reviewer_model_id"].unique().tolist()
-        if training_counts.get(user_id, 0) >= 3
+        if training_counts.get(user_id, 0) >= min_train_courses
     ]
 
     holdout_df = holdout_df[
@@ -1330,8 +1368,13 @@ def run_hybrid_offline_evaluation(backend: dict) -> dict:
         "Training interactions": int(len(train_interactions)),
         "Held-out positive interactions": int(len(holdout_df)),
         "Evaluation K": int(HYBRID_EVAL_K),
-        "Holdout fraction target": HYBRID_EVAL_TEST_FRACTION,
-        "Minimum unique courses per learner": HYBRID_EVAL_MIN_COURSES,
+        "Holdout strategy": (
+            "leave-one-positive-out"
+            if leave_one_positive_out
+            else f"~{test_fraction:.0%} positive holdout"
+        ),
+        "Minimum unique courses per learner": int(min_courses),
+        "Minimum training courses after holdout": int(min_train_courses),
     }
 
     paired_difference = {
@@ -1351,6 +1394,100 @@ def run_hybrid_offline_evaluation(backend: dict) -> dict:
         "paired_difference": paired_difference,
         "per_user_models": per_user_models,
         "per_user_weights": per_user_weights,
+    }
+
+
+def run_history_sparsity_sensitivity(
+    backend: dict,
+    thresholds=HYBRID_SENSITIVITY_THRESHOLDS,
+) -> dict:
+    """
+    Re-run the offline recommender evaluation at minimum-history thresholds
+    of 3, 4, and 5 unique courses using one held-out positive per learner.
+
+    The purpose is sensitivity analysis: it shows whether conclusions depend
+    strongly on the arbitrary minimum-history threshold and quantifies how
+    sample size changes as stricter personalisation eligibility is imposed.
+    """
+    summary_rows = []
+    detailed_results = {}
+    ndcg_col = f"NDCG@{HYBRID_EVAL_K}"
+    hit_col = f"HitRate@{HYBRID_EVAL_K}"
+    precision_col = f"Precision@{HYBRID_EVAL_K}"
+    recall_col = f"Recall@{HYBRID_EVAL_K}"
+
+    for threshold in thresholds:
+        min_train = max(2, int(threshold) - 1)
+        result = run_hybrid_offline_evaluation(
+            backend,
+            min_courses=int(threshold),
+            min_train_courses=min_train,
+            leave_one_positive_out=True,
+        )
+        detailed_results[int(threshold)] = result
+
+        model_summary = result["model_summary"].set_index("Model")
+        weight_summary = result["weight_summary"].copy()
+        paired = result["paired_difference"]
+
+        semantic_name = "SBERT profile only"
+        hybrid_name = "Hybrid SBERT + sentiment SVD (0.50)"
+        raw_hybrid_name = "Hybrid SBERT + raw SVD (0.50)"
+
+        semantic = model_summary.loc[semantic_name]
+        hybrid = model_summary.loc[hybrid_name]
+        raw_hybrid = model_summary.loc[raw_hybrid_name]
+
+        # If multiple weights tie, prefer the smaller collaborative weight.
+        best_weight_row = (
+            weight_summary
+            .sort_values(
+                [ndcg_col, "Collaborative Weight"],
+                ascending=[False, True],
+            )
+            .iloc[0]
+        )
+
+        summary_rows.append(
+            {
+                "Minimum history": int(threshold),
+                "Eligible users": int(
+                    result["protocol"]["Eligible repeat learners"]
+                ),
+                "Held-out positives": int(
+                    result["protocol"]["Held-out positive interactions"]
+                ),
+                f"SBERT {precision_col}": float(semantic[precision_col]),
+                f"SBERT {recall_col}": float(semantic[recall_col]),
+                f"SBERT {hit_col}": float(semantic[hit_col]),
+                f"SBERT {ndcg_col}": float(semantic[ndcg_col]),
+                f"Hybrid sentiment {precision_col}": float(hybrid[precision_col]),
+                f"Hybrid sentiment {recall_col}": float(hybrid[recall_col]),
+                f"Hybrid sentiment {hit_col}": float(hybrid[hit_col]),
+                f"Hybrid sentiment {ndcg_col}": float(hybrid[ndcg_col]),
+                f"Hybrid raw {ndcg_col}": float(raw_hybrid[ndcg_col]),
+                f"Δ{ndcg_col}": float(
+                    paired[f"Mean Δ {ndcg_col}"]
+                ),
+                "Δ 95% CI Lower": float(paired["95% CI Lower"]),
+                "Δ 95% CI Upper": float(paired["95% CI Upper"]),
+                "Best tested collaborative weight": float(
+                    best_weight_row["Collaborative Weight"]
+                ),
+                f"Best tested {ndcg_col}": float(
+                    best_weight_row[ndcg_col]
+                ),
+            }
+        )
+
+    summary = pd.DataFrame(summary_rows).sort_values(
+        "Minimum history"
+    ).reset_index(drop=True)
+
+    return {
+        "summary": summary,
+        "details": detailed_results,
+        "thresholds": list(map(int, thresholds)),
     }
 
 
@@ -1911,6 +2048,100 @@ with tab2:
             "implicit relevance labels, it should be reported as an internal "
             "offline recommender evaluation rather than as human-judged search "
             "relevance or causal evidence."
+        )
+
+    st.markdown(
+        "### 🔎 History-sparsity sensitivity analysis"
+    )
+
+    st.caption(
+        "This secondary experiment tests minimum learner-history thresholds "
+        "of 3, 4, and 5 unique courses. Exactly one positively rated course "
+        "is held out per learner at every threshold, making the thresholds "
+        "more directly comparable. The strict main experiment above remains "
+        "the primary evaluation; this analysis checks whether its conclusions "
+        "are sensitive to the chosen history requirement."
+    )
+
+    if st.button(
+        "Run 3/4/5-course sensitivity analysis",
+        key="run_history_sensitivity",
+    ):
+        with st.spinner(
+            "Re-running the recommender at 3, 4, and 5-course history thresholds..."
+        ):
+            try:
+                st.session_state["history_sensitivity"] = (
+                    run_history_sparsity_sensitivity(backend)
+                )
+            except Exception as exc:
+                st.error(
+                    "History-sparsity sensitivity analysis could not be completed."
+                )
+                st.exception(exc)
+
+    if "history_sensitivity" in st.session_state:
+        sensitivity = st.session_state["history_sensitivity"]
+        sensitivity_df = sensitivity["summary"].copy()
+
+        float_columns = [
+            column
+            for column in sensitivity_df.columns
+            if column not in {
+                "Minimum history",
+                "Eligible users",
+                "Held-out positives",
+            }
+        ]
+        for column in float_columns:
+            sensitivity_df[column] = sensitivity_df[column].map(
+                lambda value: round(float(value), 4)
+            )
+
+        st.markdown("#### Threshold sensitivity results")
+        st.dataframe(
+            sensitivity_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        ndcg_col = f"NDCG@{HYBRID_EVAL_K}"
+        ndcg_chart = (
+            sensitivity_df[
+                [
+                    "Minimum history",
+                    f"SBERT {ndcg_col}",
+                    f"Hybrid sentiment {ndcg_col}",
+                    f"Hybrid raw {ndcg_col}",
+                ]
+            ]
+            .set_index("Minimum history")
+        )
+        st.markdown("#### Ranking quality by history threshold")
+        st.line_chart(ndcg_chart)
+
+        sample_chart = (
+            sensitivity_df[
+                ["Minimum history", "Eligible users"]
+            ]
+            .set_index("Minimum history")
+        )
+        st.markdown("#### Eligible learner sample size")
+        st.bar_chart(sample_chart)
+
+        st.markdown("#### Interpretation guide")
+        st.write(
+            "Use this table to judge robustness rather than to select whichever "
+            "threshold gives the largest score. If the hybrid advantage remains "
+            "similar across 3, 4, and 5-course histories, the conclusion is less "
+            "dependent on the eligibility threshold. If results change sharply, "
+            "report that instability as a consequence of interaction sparsity."
+        )
+        st.caption(
+            "The paired ΔNDCG confidence interval compares the 0.50 "
+            "sentiment-aware hybrid with the SBERT-only learner-profile baseline "
+            "within each threshold. A confidence interval containing zero does "
+            "not provide clear evidence of a difference."
         )
 
     st.markdown(
