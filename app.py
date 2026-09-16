@@ -10,7 +10,7 @@ from sklearn.metrics import ndcg_score
 from surprise import Dataset, Reader, SVD, accuracy
 from surprise.model_selection import train_test_split
 
-# --- NEW ADVANCED NLP & SEARCH IMPORTS ---
+# --- ADVANCED NLP & SEARCH IMPORTS ---
 from sentence_transformers import SentenceTransformer
 import faiss
 
@@ -22,7 +22,7 @@ nltk.download('vader_lexicon', quiet=True)
 
 # --- BACKEND ENGINE (CACHED) ---
 @st.cache_resource(show_spinner="Initializing Deep Learning Models & FAISS Vector Index...")
-def load_and_train_system_v3():
+def load_and_train_system():
     # 1. Load Pre-Joined Mini Dataset
     master_df = pd.read_csv('coursera_mini_master.csv')
 
@@ -59,21 +59,6 @@ def load_and_train_system_v3():
     rmse_val = accuracy.rmse(predictions, verbose=False)
     mae_val = accuracy.mae(predictions, verbose=False)
     
-    # 3.3 Compute NDCG
-    # user_est_true = defaultdict(list)
-    # for uid, _, true_r, est, _ in predictions:
-    #     user_est_true[uid].append((est, true_r))
-        
-    # ndcg_scores = []
-    # for uid, user_ratings in user_est_true.items():
-    #     if len(user_ratings) > 1: 
-    #         user_ratings.sort(key=lambda x: x[0], reverse=True)
-    #         true_ratings = [x[1] for x in user_ratings]
-    #         predicted_ratings = [x[0] for x in user_ratings]
-    #         score = ndcg_score([true_ratings], [predicted_ratings])
-    #         ndcg_scores.append(score)
-            
-    # ndcg_val = np.mean(ndcg_scores) if ndcg_scores else 0.0
     # 3.3 Compute Strict NDCG@5 (Binary Relevance Filter)
     user_est_true = defaultdict(list)
     for uid, _, true_r, est, _ in predictions:
