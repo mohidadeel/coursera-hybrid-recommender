@@ -32,6 +32,21 @@ def load_and_train_system():
     master_df['sentiment_score'] = master_df['reviews'].apply(lambda x: sia.polarity_scores(x)['compound'])
     master_df['adjusted_rating'] = (master_df['rating'] + (0.15 * master_df['sentiment_score'])).clip(1.0, 5.0)
 
+    # 2.5 Inject Professional Demo Learner Profiles
+    # Take the top 5 most active real users and rename them to clean profiles
+    top_reviewers = master_df['reviewers'].value_counts().head(5).index.tolist()
+    demo_personas = [
+        "Demo Profile A (Heavy Tech & Data Focus)",
+        "Demo Profile B (Business & Management Focus)",
+        "Demo Profile C (General MOOC Enthusiast)",
+        "Demo Profile D (Advanced AI Learner)",
+        "Demo Profile E (Beginner/Mixed Interests)"
+    ]
+    persona_mapping = dict(zip(top_reviewers, demo_personas))
+    
+    # Apply the mapping to the dataset BEFORE training the SVD model
+    master_df['reviewers'] = master_df['reviewers'].replace(persona_mapping)
+
     # 3. Model Training & Evaluation (Collaborative SVD)
     reader = Reader(rating_scale=(1.0, 5.0))
     data_for_svd = Dataset.load_from_df(master_df[['reviewers', 'course_id', 'adjusted_rating']], reader)
@@ -79,11 +94,8 @@ def load_and_train_system():
     final_svd_model = SVD(n_factors=50, lr_all=0.005, reg_all=0.02, random_state=42)
     final_svd_model.fit(full_trainset)
 
-    # 4. Extract Unique Courses & Top Users for the UI
+    # 4. Extract Unique Courses for the UI
     unique_courses = master_df.drop_duplicates(subset=['course_id']).copy().reset_index(drop=True)
-    
-    # Extract the top 50 most active users to populate the interactive dropdown
-    top_active_users = master_df['reviewers'].value_counts().head(50).index.tolist()
     
     def clean_enrollment(val):
         if pd.isna(val): return 0
@@ -109,10 +121,10 @@ def load_and_train_system():
     faiss_index = faiss.IndexFlatIP(dimension)
     faiss_index.add(course_embeddings)
 
-    return master_df, unique_courses, final_svd_model, sbert_model, faiss_index, live_metrics, top_active_users
+    return master_df, unique_courses, final_svd_model, sbert_model, faiss_index, live_metrics, demo_personas
 
 # Initialize backend pipeline
-master_df, unique_courses, svd_model, sbert_model, faiss_index, live_metrics, top_active_users = load_and_train_system()
+master_df, unique_courses, svd_model, sbert_model, faiss_index, live_metrics, demo_personas = load_and_train_system()
 
 # --- FRONTEND UI ---
 st.title("🎓 Smart Coursera Discovery & Analytics Platform")
@@ -121,12 +133,12 @@ st.markdown("This app integrates SBERT semantic search, FAISS vector indexing, a
 # --- SIDEBAR (Upgraded Layout) ---
 st.sidebar.header("🔍 Course Discovery Controls")
 
-# NEW: User Profile Selection for Collaborative Filtering
-user_options = ["Anonymous / New Learner"] + top_active_users
+# NEW: User Profile Selection for Collaborative Filtering using Personas
+user_options = ["Anonymous / Cold Start Learner"] + demo_personas
 selected_user = st.sidebar.selectbox(
     "Select Learner Profile (SVD Collaborative Target):", 
     user_options,
-    help="Select an existing active user to see how their historical ratings alter the hybrid predictions, or choose Anonymous for a cold-start query."
+    help="Select an existing active profile to see how their historical ratings alter the hybrid predictions."
 )
 
 search_query = st.sidebar.text_input(
@@ -180,8 +192,8 @@ with tab1:
         if candidates.empty or candidates['content_match_score'].max() == 0:
             st.error(f"No courses matched your query or difficulty tier. Try adjusting your sidebar entries.")
         else:
-            # 2. COLLABORATIVE INFERENCE PREDICTION (Now personalized!)
-            target_user_id = "anonymous_learner" if selected_user == "Anonymous / New Learner" else selected_user
+            # 2. COLLABORATIVE INFERENCE PREDICTION (Personalized with Personas)
+            target_user_id = "anonymous_learner" if selected_user == "Anonymous / Cold Start Learner" else selected_user
             
             candidates['predicted_score'] = candidates['course_id'].apply(
                 lambda x: svd_model.predict(target_user_id, x).est
