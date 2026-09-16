@@ -133,7 +133,7 @@ st.markdown("This app integrates SBERT semantic search, FAISS vector indexing, a
 # --- SIDEBAR (Upgraded Layout) ---
 st.sidebar.header("🔍 Course Discovery Controls")
 
-# NEW: User Profile Selection for Collaborative Filtering using Personas
+# User Profile Selection for Collaborative Filtering using Personas
 user_options = ["Anonymous / Cold Start Learner"] + demo_personas
 selected_user = st.sidebar.selectbox(
     "Select Learner Profile (SVD Collaborative Target):", 
@@ -150,6 +150,13 @@ search_query = st.sidebar.text_input(
 selected_difficulty = st.sidebar.selectbox(
     "Pedagogical Difficulty Filter:", 
     ["Any", "Beginner", "Mixed", "Intermediate", "Advanced"]
+)
+
+# NEW: Dynamic Weight Slider for the UI/UX
+personalization_weight = st.sidebar.slider(
+    "Hybrid Engine Fusion Weight:", 
+    min_value=0.0, max_value=1.0, value=0.5, step=0.1,
+    help="0.0 = Pure Semantic Search (FAISS). 1.0 = Pure Personalized Collaborative Filtering (SVD)."
 )
 
 top_n_slider = st.sidebar.slider(
@@ -199,8 +206,17 @@ with tab1:
                 lambda x: svd_model.predict(target_user_id, x).est
             )
             
-            # 3. HYBRID FUSION: Combine FAISS semantic match (0-1) and latent SVD rating (normalized to 0-1)
-            candidates['hybrid_rank_metric'] = (candidates['content_match_score'] * 0.5) + (candidates['predicted_score'] / 5.0 * 0.5)
+            # 3. HYBRID FUSION: True Min-Max Scaling to fix "Metric Mismatch"
+            faiss_min, faiss_max = candidates['content_match_score'].min(), candidates['content_match_score'].max()
+            svd_min, svd_max = candidates['predicted_score'].min(), candidates['predicted_score'].max()
+            
+            # Safely normalize both metrics to a strict 0.0 to 1.0 scale so they fight fairly
+            candidates['faiss_norm'] = (candidates['content_match_score'] - faiss_min) / (faiss_max - faiss_min) if faiss_max > faiss_min else 0
+            candidates['svd_norm'] = (candidates['predicted_score'] - svd_min) / (svd_max - svd_min) if svd_max > svd_min else 0
+            
+            # Apply the dynamic slider weight from the sidebar
+            candidates['hybrid_rank_metric'] = (candidates['faiss_norm'] * (1.0 - personalization_weight)) + (candidates['svd_norm'] * personalization_weight)
+            
             final_sorted_recs = candidates.sort_values(by='hybrid_rank_metric', ascending=False).head(top_n_slider)
             
             # DYNAMIC HIGHLIGHT KPI CARDS
