@@ -121,7 +121,7 @@ def load_and_train_system():
     return master_df, unique_courses, final_svd_model, sbert_model, faiss_index, live_metrics, professional_ids
 
 # Initialize backend pipeline
-master_df, unique_courses, svd_model, sbert_model, faiss_index, live_metrics, professional_ids = load_and_train_system_v3()
+master_df, unique_courses, svd_model, sbert_model, faiss_index, live_metrics, professional_ids = load_and_train_system()
 
 # --- FRONTEND UI ---
 st.title("🎓 Smart Coursera Discovery & Analytics Platform")
