@@ -22,7 +22,7 @@ nltk.download('vader_lexicon', quiet=True)
 
 # --- BACKEND ENGINE (CACHED) ---
 @st.cache_resource(show_spinner="Initializing Deep Learning Models & FAISS Vector Index...")
-def load_and_train_system_v2():
+def load_and_train_system_v3():
     # 1. Load Pre-Joined Mini Dataset
     master_df = pd.read_csv('coursera_mini_master.csv')
 
@@ -74,8 +74,7 @@ def load_and_train_system_v2():
     #         ndcg_scores.append(score)
             
     # ndcg_val = np.mean(ndcg_scores) if ndcg_scores else 0.0
-    # 3.3 Compute NDCG@5 (Stricter, more realistic ranking quality metric)
-   # 3.3 Compute NDCG@5 (Stricter, more realistic ranking quality metric)
+    # 3.3 Compute Strict NDCG@5 (Binary Relevance Filter)
     user_est_true = defaultdict(list)
     for uid, _, true_r, est, _ in predictions:
         user_est_true[uid].append((est, true_r))
@@ -83,15 +82,16 @@ def load_and_train_system_v2():
     ndcg_scores = []
     for uid, user_ratings in user_est_true.items():
         if len(user_ratings) > 1: 
-            # Sort by predicted score
-            user_ratings.sort(key=lambda x: x[0], reverse=True)
-            true_ratings = [x[1] for x in user_ratings]
-            predicted_ratings = [x[0] for x in user_ratings]
+            # Convert true adjusted ratings to Binary Relevance (1 if >= 4.0, else 0)
+            # This represents whether the user actually "liked" the course or not
+            binary_true = [1 if x[1] >= 4.0 else 0 for x in user_ratings]
+            predicted_scores = [x[0] for x in user_ratings]
             
-            # Applying k=5 makes the metric much harsher, organically lowering the score
-            score = ndcg_score([true_ratings], [predicted_ratings], k=5)
-            ndcg_scores.append(score)
-            
+            # ONLY evaluate users who have a mix of liked (1) and disliked (0) items in their test set
+            if len(set(binary_true)) > 1:
+                score = ndcg_score([binary_true], [predicted_scores], k=5)
+                ndcg_scores.append(score)
+                
     ndcg_val = np.mean(ndcg_scores) if ndcg_scores else 0.0
     # 3.4 Compile Metrics Dictionary
     live_metrics = {
@@ -136,7 +136,7 @@ def load_and_train_system_v2():
     return master_df, unique_courses, final_svd_model, sbert_model, faiss_index, live_metrics, professional_ids
 
 # Initialize backend pipeline
-master_df, unique_courses, svd_model, sbert_model, faiss_index, live_metrics, professional_ids = load_and_train_system_v2()
+master_df, unique_courses, svd_model, sbert_model, faiss_index, live_metrics, professional_ids = load_and_train_system_v3()
 
 # --- FRONTEND UI ---
 st.title("🎓 Smart Coursera Discovery & Analytics Platform")
