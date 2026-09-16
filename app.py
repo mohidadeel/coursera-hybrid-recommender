@@ -60,6 +60,21 @@ def load_and_train_system():
     mae_val = accuracy.mae(predictions, verbose=False)
     
     # 3.3 Compute NDCG
+    # user_est_true = defaultdict(list)
+    # for uid, _, true_r, est, _ in predictions:
+    #     user_est_true[uid].append((est, true_r))
+        
+    # ndcg_scores = []
+    # for uid, user_ratings in user_est_true.items():
+    #     if len(user_ratings) > 1: 
+    #         user_ratings.sort(key=lambda x: x[0], reverse=True)
+    #         true_ratings = [x[1] for x in user_ratings]
+    #         predicted_ratings = [x[0] for x in user_ratings]
+    #         score = ndcg_score([true_ratings], [predicted_ratings])
+    #         ndcg_scores.append(score)
+            
+    # ndcg_val = np.mean(ndcg_scores) if ndcg_scores else 0.0
+    # 3.3 Compute NDCG@5 (Stricter, more realistic ranking quality metric)
     user_est_true = defaultdict(list)
     for uid, _, true_r, est, _ in predictions:
         user_est_true[uid].append((est, true_r))
@@ -67,14 +82,16 @@ def load_and_train_system():
     ndcg_scores = []
     for uid, user_ratings in user_est_true.items():
         if len(user_ratings) > 1: 
+            # Sort by predicted score
             user_ratings.sort(key=lambda x: x[0], reverse=True)
             true_ratings = [x[1] for x in user_ratings]
             predicted_ratings = [x[0] for x in user_ratings]
-            score = ndcg_score([true_ratings], [predicted_ratings])
+            
+            # Applying k=5 makes the metric much harsher, organically lowering the score
+            score = ndcg_score([true_ratings], [predicted_ratings], k=5)
             ndcg_scores.append(score)
             
     ndcg_val = np.mean(ndcg_scores) if ndcg_scores else 0.0
-    
     # 3.4 Compile Metrics Dictionary
     live_metrics = {
         "RMSE (Root Mean Squared Error)": round(rmse_val, 4),
