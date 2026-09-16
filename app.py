@@ -75,6 +75,7 @@ def load_and_train_system():
             
     # ndcg_val = np.mean(ndcg_scores) if ndcg_scores else 0.0
     # 3.3 Compute NDCG@5 (Stricter, more realistic ranking quality metric)
+   # 3.3 Compute NDCG@5 (Stricter, more realistic ranking quality metric)
     user_est_true = defaultdict(list)
     for uid, _, true_r, est, _ in predictions:
         user_est_true[uid].append((est, true_r))
