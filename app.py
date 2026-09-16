@@ -22,7 +22,7 @@ nltk.download('vader_lexicon', quiet=True)
 
 # --- BACKEND ENGINE (CACHED) ---
 @st.cache_resource(show_spinner="Initializing Deep Learning Models & FAISS Vector Index...")
-def load_and_train_system():
+def load_and_train_system_v2():
     # 1. Load Pre-Joined Mini Dataset
     master_df = pd.read_csv('coursera_mini_master.csv')
 
@@ -136,7 +136,7 @@ def load_and_train_system():
     return master_df, unique_courses, final_svd_model, sbert_model, faiss_index, live_metrics, professional_ids
 
 # Initialize backend pipeline
-master_df, unique_courses, svd_model, sbert_model, faiss_index, live_metrics, professional_ids = load_and_train_system()
+master_df, unique_courses, svd_model, sbert_model, faiss_index, live_metrics, professional_ids = load_and_train_system_v2()
 
 # --- FRONTEND UI ---
 st.title("🎓 Smart Coursera Discovery & Analytics Platform")
@@ -153,7 +153,7 @@ selected_user = st.sidebar.selectbox(
     help="Select an existing student ID to query their historical enrollments and alter hybrid predictions."
 )
 
-# --- NEW: ACTIVE STUDENT PROFILE PANEL ---
+# --- ACTIVE STUDENT PROFILE PANEL ---
 if selected_user != "Anonymous / Cold Start Learner":
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 🧑‍🎓 Active Student Profile")
