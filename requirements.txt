@@ -6,3 +6,5 @@ scikit-learn
 scikit-surprise
 matplotlib
 seaborn
+faiss-cpu
+sentence-transformers
