@@ -43,6 +43,12 @@ DEFAULT_TOP_N = 5
 MIN_RETRIEVAL_POOL = 100
 RETRIEVAL_MULTIPLIER = 20
 
+HYBRID_EVAL_WEIGHTS = [0.0, 0.25, 0.5, 0.75, 1.0]
+HYBRID_EVAL_MIN_COURSES = 5
+HYBRID_EVAL_TEST_FRACTION = 0.20
+HYBRID_EVAL_K = 5
+HYBRID_EVAL_BOOTSTRAPS = 1000
+
 BENCHMARK_QUERIES = [
     "Data Science",
     "Python",
@@ -558,6 +564,7 @@ def load_and_train_system():
         "professional_ids": professional_ids,
         "dataset_path": str(dataset_path),
         "embedding_dimension": int(embedding_dimension),
+        "course_embeddings": course_embeddings,
     }
 
 
@@ -797,6 +804,554 @@ def run_latency_benchmark(
             )
 
     return pd.DataFrame(rows)
+
+
+
+def _ranking_metrics_at_k(ranked_course_ids, relevant_course_ids, k=5):
+    """Return Precision@K, Recall@K, HitRate@K and NDCG@K for one user."""
+    relevant = set(relevant_course_ids)
+    topk = list(ranked_course_ids[:k])
+
+    if not relevant:
+        return {
+            f"Precision@{k}": np.nan,
+            f"Recall@{k}": np.nan,
+            f"HitRate@{k}": np.nan,
+            f"NDCG@{k}": np.nan,
+        }
+
+    hits = [1 if course_id in relevant else 0 for course_id in topk]
+    hit_count = sum(hits)
+
+    precision = hit_count / k
+    recall = hit_count / len(relevant)
+    hit_rate = 1.0 if hit_count > 0 else 0.0
+
+    dcg = 0.0
+    for rank, is_relevant in enumerate(hits, start=1):
+        if is_relevant:
+            dcg += 1.0 / np.log2(rank + 1)
+
+    ideal_hits = min(len(relevant), k)
+    idcg = sum(
+        1.0 / np.log2(rank + 1)
+        for rank in range(1, ideal_hits + 1)
+    )
+    ndcg = dcg / idcg if idcg > 0 else 0.0
+
+    return {
+        f"Precision@{k}": float(precision),
+        f"Recall@{k}": float(recall),
+        f"HitRate@{k}": float(hit_rate),
+        f"NDCG@{k}": float(ndcg),
+    }
+
+
+def _bootstrap_mean_ci(values, n_bootstraps=1000, seed=42):
+    """Non-parametric 95% bootstrap CI for a mean."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+
+    if len(values) == 0:
+        return np.nan, np.nan, np.nan
+
+    rng = np.random.default_rng(seed)
+    sample_means = np.empty(n_bootstraps, dtype=float)
+
+    for index in range(n_bootstraps):
+        sample = rng.choice(values, size=len(values), replace=True)
+        sample_means[index] = sample.mean()
+
+    return (
+        float(values.mean()),
+        float(np.percentile(sample_means, 2.5)),
+        float(np.percentile(sample_means, 97.5)),
+    )
+
+
+def _bootstrap_paired_difference_ci(
+    values_a,
+    values_b,
+    n_bootstraps=1000,
+    seed=42,
+):
+    """Bootstrap CI for the paired mean difference A - B."""
+    a = np.asarray(values_a, dtype=float)
+    b = np.asarray(values_b, dtype=float)
+
+    valid = np.isfinite(a) & np.isfinite(b)
+    a = a[valid]
+    b = b[valid]
+
+    if len(a) == 0:
+        return np.nan, np.nan, np.nan
+
+    differences = a - b
+    rng = np.random.default_rng(seed)
+    bootstrap_means = np.empty(n_bootstraps, dtype=float)
+
+    for index in range(n_bootstraps):
+        sample = rng.choice(
+            differences,
+            size=len(differences),
+            replace=True,
+        )
+        bootstrap_means[index] = sample.mean()
+
+    return (
+        float(differences.mean()),
+        float(np.percentile(bootstrap_means, 2.5)),
+        float(np.percentile(bootstrap_means, 97.5)),
+    )
+
+
+def run_hybrid_offline_evaluation(backend: dict) -> dict:
+    """
+    Evaluate the complete recommendation design using a reproducible
+    leave-some-positive-out protocol over repeat learners.
+
+    Protocol:
+    - Aggregate to one interaction per learner/course.
+    - Keep learners with >= 5 unique courses and at least one positive item.
+    - Hold out ~20% of positive courses, at least one, while retaining >= 3
+      training courses.
+    - Build each learner's semantic profile from their remaining positively
+      rated courses.
+    - Rank all courses the learner did not train on.
+    - Compare global quality, SBERT-only, raw-rating SVD, sentiment-adjusted
+      SVD, and two 50/50 hybrid variants.
+    - Sweep hybrid personalisation weights using the sentiment-adjusted SVD.
+
+    This is an internal offline evaluation based on historical interactions,
+    not an external human relevance judgement.
+    """
+    master_df = backend["master_df"]
+    unique_courses = backend["unique_courses"]
+    course_embeddings = backend["course_embeddings"]
+
+    course_ids = unique_courses["course_id"].astype(str).tolist()
+    course_id_to_position = {
+        course_id: index
+        for index, course_id in enumerate(course_ids)
+    }
+
+    interactions = (
+        master_df.groupby(
+            ["reviewer_model_id", "course_id"],
+            as_index=False,
+        )
+        .agg(
+            raw_rating=("rating", "mean"),
+            adjusted_rating=("adjusted_rating", "mean"),
+        )
+    )
+
+    # Exclude synthetic missing-reviewer IDs and placeholder-like reviewer labels.
+    interactions = interactions[
+        ~interactions["reviewer_model_id"].str.startswith("MissingReviewer_")
+    ].copy().reset_index(drop=True)
+
+    user_stats = (
+        interactions.groupby("reviewer_model_id")
+        .agg(
+            unique_courses=("course_id", "nunique"),
+            positive_courses=(
+                "raw_rating",
+                lambda ratings: int((ratings >= 4.0).sum()),
+            ),
+        )
+    )
+
+    eligible_users = user_stats[
+        (user_stats["unique_courses"] >= HYBRID_EVAL_MIN_COURSES)
+        & (user_stats["positive_courses"] >= 1)
+    ].index.tolist()
+
+    rng = np.random.default_rng(RANDOM_STATE)
+    holdout_rows = []
+    train_mask = np.ones(len(interactions), dtype=bool)
+
+    for user_id in eligible_users:
+        user_indices = interactions.index[
+            interactions["reviewer_model_id"] == user_id
+        ].to_numpy()
+
+        positive_indices = interactions.index[
+            (interactions["reviewer_model_id"] == user_id)
+            & (interactions["raw_rating"] >= 4.0)
+        ].to_numpy()
+
+        if len(positive_indices) == 0:
+            continue
+
+        desired_test = max(
+            1,
+            int(np.ceil(
+                len(user_indices) * HYBRID_EVAL_TEST_FRACTION
+            )),
+        )
+        max_test = max(1, len(user_indices) - 3)
+        test_count = min(
+            desired_test,
+            len(positive_indices),
+            max_test,
+        )
+
+        selected = rng.choice(
+            positive_indices,
+            size=test_count,
+            replace=False,
+        )
+
+        train_mask[selected] = False
+        for row_index in selected:
+            holdout_rows.append(
+                interactions.loc[row_index].to_dict()
+            )
+
+    train_interactions = interactions.loc[train_mask].copy()
+    holdout_df = pd.DataFrame(holdout_rows)
+
+    if holdout_df.empty:
+        raise ValueError(
+            "No eligible repeat learners were available for hybrid evaluation."
+        )
+
+    # Only users who still have enough training history after holdout are evaluated.
+    training_counts = (
+        train_interactions.groupby("reviewer_model_id")["course_id"]
+        .nunique()
+    )
+    eval_users = [
+        user_id
+        for user_id in holdout_df["reviewer_model_id"].unique().tolist()
+        if training_counts.get(user_id, 0) >= 3
+    ]
+
+    holdout_df = holdout_df[
+        holdout_df["reviewer_model_id"].isin(eval_users)
+    ].copy()
+
+    # Train two SVD variants so the contribution of VADER-adjusted ratings can
+    # be measured rather than merely asserted.
+    reader = Reader(rating_scale=(1.0, 5.0))
+
+    raw_data = Dataset.load_from_df(
+        train_interactions[
+            ["reviewer_model_id", "course_id", "raw_rating"]
+        ],
+        reader,
+    )
+    raw_trainset = raw_data.build_full_trainset()
+    raw_svd = SVD(
+        n_factors=SVD_FACTORS,
+        lr_all=SVD_LR,
+        reg_all=SVD_REG,
+        random_state=RANDOM_STATE,
+    )
+    raw_svd.fit(raw_trainset)
+
+    adjusted_data = Dataset.load_from_df(
+        train_interactions[
+            ["reviewer_model_id", "course_id", "adjusted_rating"]
+        ],
+        reader,
+    )
+    adjusted_trainset = adjusted_data.build_full_trainset()
+    adjusted_svd = SVD(
+        n_factors=SVD_FACTORS,
+        lr_all=SVD_LR,
+        reg_all=SVD_REG,
+        random_state=RANDOM_STATE,
+    )
+    adjusted_svd.fit(adjusted_trainset)
+
+    # Global non-personalised quality baseline, calculated from training data only.
+    course_quality = (
+        train_interactions.groupby("course_id")["adjusted_rating"]
+        .mean()
+        .to_dict()
+    )
+    global_quality_default = float(
+        train_interactions["adjusted_rating"].mean()
+    )
+
+    model_rows = []
+    weight_rows = []
+
+    for user_id in eval_users:
+        user_train = train_interactions[
+            train_interactions["reviewer_model_id"] == user_id
+        ].copy()
+        user_test = holdout_df[
+            holdout_df["reviewer_model_id"] == user_id
+        ].copy()
+
+        relevant_course_ids = set(
+            user_test["course_id"].astype(str).tolist()
+        )
+        seen_course_ids = set(
+            user_train["course_id"].astype(str).tolist()
+        )
+
+        candidate_course_ids = [
+            course_id
+            for course_id in course_ids
+            if course_id not in seen_course_ids
+        ]
+
+        if not candidate_course_ids:
+            continue
+
+        # Semantic user profile: mean embedding of positively rated training courses.
+        profile_rows = user_train[
+            user_train["raw_rating"] >= 4.0
+        ]
+        if profile_rows.empty:
+            profile_rows = user_train
+
+        profile_positions = [
+            course_id_to_position[str(course_id)]
+            for course_id in profile_rows["course_id"]
+            if str(course_id) in course_id_to_position
+        ]
+
+        if not profile_positions:
+            continue
+
+        profile_vector = course_embeddings[
+            profile_positions
+        ].mean(axis=0)
+
+        profile_norm = np.linalg.norm(profile_vector)
+        if profile_norm > 0:
+            profile_vector = profile_vector / profile_norm
+
+        candidate_positions = [
+            course_id_to_position[course_id]
+            for course_id in candidate_course_ids
+        ]
+        candidate_matrix = course_embeddings[
+            candidate_positions
+        ]
+
+        semantic_scores = candidate_matrix @ profile_vector
+
+        raw_svd_scores = np.array(
+            [
+                raw_svd.predict(user_id, course_id).est
+                for course_id in candidate_course_ids
+            ],
+            dtype=float,
+        )
+        adjusted_svd_scores = np.array(
+            [
+                adjusted_svd.predict(user_id, course_id).est
+                for course_id in candidate_course_ids
+            ],
+            dtype=float,
+        )
+        quality_scores = np.array(
+            [
+                course_quality.get(
+                    course_id,
+                    global_quality_default,
+                )
+                for course_id in candidate_course_ids
+            ],
+            dtype=float,
+        )
+
+        scoring_frame = pd.DataFrame(
+            {
+                "course_id": candidate_course_ids,
+                "quality": quality_scores,
+                "semantic": semantic_scores,
+                "svd_raw": raw_svd_scores,
+                "svd_sentiment": adjusted_svd_scores,
+            }
+        )
+
+        scoring_frame["quality_norm"] = minmax_scale(
+            scoring_frame["quality"]
+        )
+        scoring_frame["semantic_norm"] = minmax_scale(
+            scoring_frame["semantic"]
+        )
+        scoring_frame["svd_raw_norm"] = minmax_scale(
+            scoring_frame["svd_raw"]
+        )
+        scoring_frame["svd_sentiment_norm"] = minmax_scale(
+            scoring_frame["svd_sentiment"]
+        )
+
+        scoring_frame["hybrid_raw_50"] = (
+            0.5 * scoring_frame["semantic_norm"]
+            + 0.5 * scoring_frame["svd_raw_norm"]
+        )
+        scoring_frame["hybrid_sentiment_50"] = (
+            0.5 * scoring_frame["semantic_norm"]
+            + 0.5 * scoring_frame["svd_sentiment_norm"]
+        )
+
+        model_score_columns = {
+            "Global quality baseline": "quality_norm",
+            "SBERT profile only": "semantic_norm",
+            "SVD raw ratings only": "svd_raw_norm",
+            "SVD sentiment-adjusted only": "svd_sentiment_norm",
+            "Hybrid SBERT + raw SVD (0.50)": "hybrid_raw_50",
+            "Hybrid SBERT + sentiment SVD (0.50)": "hybrid_sentiment_50",
+        }
+
+        for model_name, score_column in model_score_columns.items():
+            ranked_ids = (
+                scoring_frame
+                .sort_values(score_column, ascending=False)["course_id"]
+                .tolist()
+            )
+
+            metrics = _ranking_metrics_at_k(
+                ranked_ids,
+                relevant_course_ids,
+                k=HYBRID_EVAL_K,
+            )
+            model_rows.append(
+                {
+                    "User": user_id,
+                    "Model": model_name,
+                    **metrics,
+                }
+            )
+
+        for weight in HYBRID_EVAL_WEIGHTS:
+            score_column = (
+                (1.0 - weight) * scoring_frame["semantic_norm"]
+                + weight * scoring_frame["svd_sentiment_norm"]
+            )
+            ranked_ids = (
+                scoring_frame.assign(weighted_score=score_column)
+                .sort_values("weighted_score", ascending=False)["course_id"]
+                .tolist()
+            )
+            metrics = _ranking_metrics_at_k(
+                ranked_ids,
+                relevant_course_ids,
+                k=HYBRID_EVAL_K,
+            )
+            weight_rows.append(
+                {
+                    "User": user_id,
+                    "Collaborative Weight": weight,
+                    **metrics,
+                }
+            )
+
+    per_user_models = pd.DataFrame(model_rows)
+    per_user_weights = pd.DataFrame(weight_rows)
+
+    if per_user_models.empty:
+        raise ValueError(
+            "Hybrid evaluation produced no per-user rankings."
+        )
+
+    metric_columns = [
+        f"Precision@{HYBRID_EVAL_K}",
+        f"Recall@{HYBRID_EVAL_K}",
+        f"HitRate@{HYBRID_EVAL_K}",
+        f"NDCG@{HYBRID_EVAL_K}",
+    ]
+
+    model_summary = (
+        per_user_models
+        .groupby("Model")[metric_columns]
+        .mean()
+        .reset_index()
+    )
+    model_summary["Users"] = (
+        per_user_models.groupby("Model")["User"]
+        .nunique()
+        .reindex(model_summary["Model"])
+        .to_numpy()
+    )
+
+    weight_summary = (
+        per_user_weights
+        .groupby("Collaborative Weight")[metric_columns]
+        .mean()
+        .reset_index()
+    )
+
+    # 95% CIs for NDCG@5 by model.
+    ci_rows = []
+    ndcg_col = f"NDCG@{HYBRID_EVAL_K}"
+    for model_name, group in per_user_models.groupby("Model"):
+        mean_value, ci_low, ci_high = _bootstrap_mean_ci(
+            group[ndcg_col].to_numpy(),
+            n_bootstraps=HYBRID_EVAL_BOOTSTRAPS,
+            seed=RANDOM_STATE,
+        )
+        ci_rows.append(
+            {
+                "Model": model_name,
+                f"Mean {ndcg_col}": mean_value,
+                "95% CI Lower": ci_low,
+                "95% CI Upper": ci_high,
+            }
+        )
+
+    ndcg_ci = pd.DataFrame(ci_rows)
+
+    # Paired bootstrap difference for the main claim:
+    # sentiment-aware hybrid vs semantic-only baseline.
+    pivot = (
+        per_user_models
+        .pivot(index="User", columns="Model", values=ndcg_col)
+    )
+    main_hybrid_name = "Hybrid SBERT + sentiment SVD (0.50)"
+    semantic_name = "SBERT profile only"
+
+    if (
+        main_hybrid_name in pivot.columns
+        and semantic_name in pivot.columns
+    ):
+        diff_mean, diff_low, diff_high = (
+            _bootstrap_paired_difference_ci(
+                pivot[main_hybrid_name].to_numpy(),
+                pivot[semantic_name].to_numpy(),
+                n_bootstraps=HYBRID_EVAL_BOOTSTRAPS,
+                seed=RANDOM_STATE,
+            )
+        )
+    else:
+        diff_mean = diff_low = diff_high = np.nan
+
+    evaluation_protocol = {
+        "Eligible repeat learners": int(len(eval_users)),
+        "Training interactions": int(len(train_interactions)),
+        "Held-out positive interactions": int(len(holdout_df)),
+        "Evaluation K": int(HYBRID_EVAL_K),
+        "Holdout fraction target": HYBRID_EVAL_TEST_FRACTION,
+        "Minimum unique courses per learner": HYBRID_EVAL_MIN_COURSES,
+    }
+
+    paired_difference = {
+        "Comparison": (
+            "Hybrid SBERT + sentiment SVD (0.50) minus SBERT profile only"
+        ),
+        f"Mean Δ {ndcg_col}": diff_mean,
+        "95% CI Lower": diff_low,
+        "95% CI Upper": diff_high,
+    }
+
+    return {
+        "protocol": evaluation_protocol,
+        "model_summary": model_summary,
+        "weight_summary": weight_summary,
+        "ndcg_ci": ndcg_ci,
+        "paired_difference": paired_difference,
+        "per_user_models": per_user_models,
+        "per_user_weights": per_user_weights,
+    }
 
 
 # ============================================================
@@ -1165,11 +1720,12 @@ with tab2:
     )
 
     st.info(
-        "The collaborative-filtering metrics below evaluate the SVD component "
-        "using out-of-fold predictions. They are deliberately not presented as "
-        "overall hybrid-recommender accuracy. A valid hybrid NDCG/Precision/"
-        "Recall score requires an external or manually labelled query-relevance "
-        "test set, which is not present in the uploaded Coursera dataset."
+        "The first table evaluates the SVD component using out-of-fold "
+        "predictions. A separate hybrid experiment below evaluates the "
+        "personalised ranking components with a reproducible leave-some-positive-out "
+        "protocol over repeat learners. Those hybrid metrics are internal "
+        "offline measures based on historical interactions, not external human "
+        "relevance judgements."
     )
 
     st.markdown(
@@ -1198,6 +1754,164 @@ with tab2:
         "users whose held-out interactions contain both liked and non-liked "
         "courses, and the number of evaluated users is shown explicitly."
     )
+
+
+    st.markdown(
+        "### 🧪 Profile-based hybrid recommender evaluation"
+    )
+
+    st.caption(
+        "Protocol: repeat learners with at least five unique courses are "
+        "evaluated using a reproducible leave-some-positive-out split. "
+        "Because the dataset does not contain ground-truth relevance labels for "
+        "arbitrary typed search queries, the learner's remaining positively rated "
+        "courses form a semantic SBERT profile for this offline test. Previously "
+        "seen courses are excluded, and metrics are calculated over held-out liked courses."
+    )
+
+    if st.button(
+        "Run hybrid baseline & ablation evaluation",
+        key="run_hybrid_evaluation",
+    ):
+        with st.spinner(
+            "Training raw/sentiment SVD baselines and evaluating personalised rankings..."
+        ):
+            try:
+                st.session_state["hybrid_evaluation"] = (
+                    run_hybrid_offline_evaluation(backend)
+                )
+            except Exception as exc:
+                st.error(
+                    "Hybrid evaluation could not be completed."
+                )
+                st.exception(exc)
+
+    if "hybrid_evaluation" in st.session_state:
+        hybrid_eval = st.session_state["hybrid_evaluation"]
+
+        protocol_df = pd.DataFrame(
+            {
+                "Protocol item": list(
+                    hybrid_eval["protocol"].keys()
+                ),
+                "Value": list(
+                    hybrid_eval["protocol"].values()
+                ),
+            }
+        )
+        st.markdown("#### Evaluation protocol")
+        st.dataframe(
+            protocol_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("#### Baseline and ablation results")
+        model_summary = hybrid_eval["model_summary"].copy()
+
+        metric_cols = [
+            f"Precision@{HYBRID_EVAL_K}",
+            f"Recall@{HYBRID_EVAL_K}",
+            f"HitRate@{HYBRID_EVAL_K}",
+            f"NDCG@{HYBRID_EVAL_K}",
+        ]
+        for col in metric_cols:
+            model_summary[col] = model_summary[col].map(
+                lambda value: round(float(value), 4)
+            )
+
+        model_summary = model_summary.sort_values(
+            f"NDCG@{HYBRID_EVAL_K}",
+            ascending=False,
+        )
+
+        st.dataframe(
+            model_summary,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("#### Hybrid weight sweep")
+        weight_summary = hybrid_eval["weight_summary"].copy()
+        for col in metric_cols:
+            weight_summary[col] = weight_summary[col].map(
+                lambda value: round(float(value), 4)
+            )
+
+        st.dataframe(
+            weight_summary,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        chart_data = (
+            weight_summary[
+                ["Collaborative Weight", f"NDCG@{HYBRID_EVAL_K}"]
+            ]
+            .set_index("Collaborative Weight")
+        )
+        st.line_chart(chart_data)
+
+        st.markdown("#### NDCG confidence intervals")
+        ci_df = hybrid_eval["ndcg_ci"].copy()
+        for col in [
+            f"Mean NDCG@{HYBRID_EVAL_K}",
+            "95% CI Lower",
+            "95% CI Upper",
+        ]:
+            if col in ci_df.columns:
+                ci_df[col] = ci_df[col].map(
+                    lambda value: round(float(value), 4)
+                )
+
+        st.dataframe(
+            ci_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        paired = hybrid_eval["paired_difference"]
+        delta = paired[
+            f"Mean Δ NDCG@{HYBRID_EVAL_K}"
+        ]
+        lower = paired["95% CI Lower"]
+        upper = paired["95% CI Upper"]
+
+        st.markdown("#### Paired bootstrap comparison")
+        st.write(
+            f"**{paired['Comparison']}**"
+        )
+        st.write(
+            f"Mean ΔNDCG@{HYBRID_EVAL_K}: "
+            f"**{delta:.4f}** "
+            f"(95% bootstrap CI: **{lower:.4f} to {upper:.4f}**)"
+        )
+        if np.isfinite(lower) and np.isfinite(upper):
+            if lower > 0:
+                st.success(
+                    "The 95% bootstrap interval is above zero, so the "
+                    "sentiment-aware hybrid improved NDCG over the semantic-only "
+                    "baseline in this internal evaluation."
+                )
+            elif upper < 0:
+                st.warning(
+                    "The 95% bootstrap interval is below zero, so the "
+                    "sentiment-aware hybrid underperformed the semantic-only "
+                    "baseline in this internal evaluation."
+                )
+            else:
+                st.info(
+                    "The 95% bootstrap interval crosses zero. The experiment "
+                    "does not provide clear evidence that the sentiment-aware "
+                    "hybrid differs from the semantic-only baseline."
+                )
+
+        st.caption(
+            "Because this experiment uses historical Coursera interactions as "
+            "implicit relevance labels, it should be reported as an internal "
+            "offline recommender evaluation rather than as human-judged search "
+            "relevance or causal evidence."
+        )
 
     st.markdown(
         "### 🗣️ Sentiment diagnostic"
