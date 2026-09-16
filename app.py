@@ -32,17 +32,11 @@ def load_and_train_system():
     master_df['sentiment_score'] = master_df['reviews'].apply(lambda x: sia.polarity_scores(x)['compound'])
     master_df['adjusted_rating'] = (master_df['rating'] + (0.15 * master_df['sentiment_score'])).clip(1.0, 5.0)
 
-    # 2.5 Inject Professional Demo Learner Profiles
-    # Take the top 5 most active real users and rename them to clean profiles
+    # 2.5 Dynamic Academic Profile Mapping
+    # Take the top 5 most active real users and map them to professional IDs
     top_reviewers = master_df['reviewers'].value_counts().head(5).index.tolist()
-    demo_personas = [
-        "Demo Profile A (Heavy Tech & Data Focus)",
-        "Demo Profile B (Business & Management Focus)",
-        "Demo Profile C (General MOOC Enthusiast)",
-        "Demo Profile D (Advanced AI Learner)",
-        "Demo Profile E (Beginner/Mixed Interests)"
-    ]
-    persona_mapping = dict(zip(top_reviewers, demo_personas))
+    professional_ids = [f"Learner_00{i+1}" for i in range(5)]
+    persona_mapping = dict(zip(top_reviewers, professional_ids))
     
     # Apply the mapping to the dataset BEFORE training the SVD model
     master_df['reviewers'] = master_df['reviewers'].replace(persona_mapping)
@@ -121,10 +115,10 @@ def load_and_train_system():
     faiss_index = faiss.IndexFlatIP(dimension)
     faiss_index.add(course_embeddings)
 
-    return master_df, unique_courses, final_svd_model, sbert_model, faiss_index, live_metrics, demo_personas
+    return master_df, unique_courses, final_svd_model, sbert_model, faiss_index, live_metrics, professional_ids
 
 # Initialize backend pipeline
-master_df, unique_courses, svd_model, sbert_model, faiss_index, live_metrics, demo_personas = load_and_train_system()
+master_df, unique_courses, svd_model, sbert_model, faiss_index, live_metrics, professional_ids = load_and_train_system()
 
 # --- FRONTEND UI ---
 st.title("🎓 Smart Coursera Discovery & Analytics Platform")
@@ -133,13 +127,30 @@ st.markdown("This app integrates SBERT semantic search, FAISS vector indexing, a
 # --- SIDEBAR (Upgraded Layout) ---
 st.sidebar.header("🔍 Course Discovery Controls")
 
-# User Profile Selection for Collaborative Filtering using Personas
-user_options = ["Anonymous / Cold Start Learner"] + demo_personas
+# User Profile Selection for Collaborative Filtering
+user_options = ["Anonymous / Cold Start Learner"] + professional_ids
 selected_user = st.sidebar.selectbox(
-    "Select Learner Profile (SVD Collaborative Target):", 
+    "Simulate Student Login (SVD Target):", 
     user_options,
-    help="Select an existing active profile to see how their historical ratings alter the hybrid predictions."
+    help="Select an existing student ID to query their historical enrollments and alter hybrid predictions."
 )
+
+# --- NEW: ACTIVE STUDENT PROFILE PANEL ---
+if selected_user != "Anonymous / Cold Start Learner":
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🧑‍🎓 Active Student Profile")
+    st.sidebar.markdown(f"**Student ID:** `{selected_user}`")
+    
+    # Dynamically extract this user's historical courses from the master dataset
+    user_history = master_df[master_df['reviewers'] == selected_user]['name'].unique().tolist()
+    
+    st.sidebar.markdown(f"**Historical Enrollments ({len(user_history)}):**")
+    # Display the first 5 courses they took as proof of their "Skills"
+    display_courses = ", ".join(user_history[:5])
+    if len(user_history) > 5:
+        display_courses += "..."
+    st.sidebar.caption(display_courses)
+    st.sidebar.markdown("---")
 
 search_query = st.sidebar.text_input(
     "What topic do you want to learn today?", 
@@ -152,7 +163,7 @@ selected_difficulty = st.sidebar.selectbox(
     ["Any", "Beginner", "Mixed", "Intermediate", "Advanced"]
 )
 
-# NEW: Dynamic Weight Slider for the UI/UX
+# Dynamic Weight Slider for the UI/UX
 personalization_weight = st.sidebar.slider(
     "Hybrid Engine Fusion Weight:", 
     min_value=0.0, max_value=1.0, value=0.5, step=0.1,
@@ -199,7 +210,7 @@ with tab1:
         if candidates.empty or candidates['content_match_score'].max() == 0:
             st.error(f"No courses matched your query or difficulty tier. Try adjusting your sidebar entries.")
         else:
-            # 2. COLLABORATIVE INFERENCE PREDICTION (Personalized with Personas)
+            # 2. COLLABORATIVE INFERENCE PREDICTION (Personalized with Actual History)
             target_user_id = "anonymous_learner" if selected_user == "Anonymous / Cold Start Learner" else selected_user
             
             candidates['predicted_score'] = candidates['course_id'].apply(
